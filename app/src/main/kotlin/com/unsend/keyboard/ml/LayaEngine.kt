@@ -3,9 +3,9 @@ package com.unsend.keyboard.ml
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
-import ai.onnxruntime.providers.NNAPIFlags
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,9 +18,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.ByteBuffer
-import java.nio.LongBuffer
-import java.util.EnumSet
+import java.util.concurrent.TimeUnit
 
 /**
  * Manages the on-device Laya ONNX Runtime session and single-forward-pass tone/risk inference.
@@ -137,20 +135,22 @@ class LayaEngine(context: Context) {
         sessionMutex.withLock {
             if (ortSession != null) return
             withContext(Dispatchers.IO) {
-                val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
-                val options = OrtSession.SessionOptions().apply {
-                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                    setIntraOpNumThreads(2)
-                    runCatching {
-                        addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
+                runCatching {
+                    val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
+                    val options = OrtSession.SessionOptions().apply {
+                        setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                        setIntraOpNumThreads(4)
                     }
-                }
-                ortSession = env.createSession(modelFile.absolutePath, options)
-                val vocabFile = findVocabFile()
-                tokenizer = when {
-                    vocabFile == null -> Tokenizer()
-                    vocabFile.name.endsWith(".json", ignoreCase = true) -> Tokenizer.fromTokenizerJson(vocabFile)
-                    else -> Tokenizer.fromVocabFile(vocabFile)
+                    ortSession = env.createSession(modelFile.absolutePath, options)
+                    val vocabFile = findVocabFile()
+                    tokenizer = when {
+                        vocabFile == null -> Tokenizer()
+                        vocabFile.name.endsWith(".json", ignoreCase = true) -> Tokenizer.fromTokenizerJson(vocabFile)
+                        else -> Tokenizer.fromVocabFile(vocabFile)
+                    }
+                }.onFailure { err ->
+                    Log.e(TAG, "Failed to load ONNX session", err)
+                    ortSession = null
                 }
             }
         }
@@ -184,14 +184,19 @@ class LayaEngine(context: Context) {
             val session = ortSession
             val env = ortEnv
             if (session != null && env != null) {
-                return@withContext runOnnxInference(
-                    env = env,
-                    session = session,
-                    draft = draft,
-                    incomingReply = incomingReply,
-                    preset = preset,
-                    startMs = startMs,
-                )
+                val onnxResult = runCatching {
+                    runOnnxInference(
+                        env = env,
+                        session = session,
+                        draft = draft,
+                        incomingReply = incomingReply,
+                        preset = preset,
+                        startMs = startMs,
+                    )
+                }.onFailure { err ->
+                    Log.e(TAG, "ONNX inference failed, falling back to built-in analyzer", err)
+                }.getOrNull()
+                if (onnxResult != null) return@withContext onnxResult
             }
         }
 
@@ -218,20 +223,10 @@ class LayaEngine(context: Context) {
 
         val prompt = ToneSchema.buildPrompt(draft, incomingReply, preset)
         val tokenized = tokenizer.tokenize(prompt)
-        val seqLen = tokenized.inputIds.size.toLong()
-        val shape = longArrayOf(1L, seqLen)
 
         val rawLogits: FloatArray = sessionMutex.withLock {
-            val inputIdsTensor = OnnxTensor.createTensor(
-                env,
-                LongBuffer.wrap(tokenized.inputIds),
-                shape,
-            )
-            val maskTensor = OnnxTensor.createTensor(
-                env,
-                LongBuffer.wrap(tokenized.attentionMask),
-                shape,
-            )
+            val inputIdsTensor = OnnxTensor.createTensor(env, arrayOf(tokenized.inputIds))
+            val maskTensor = OnnxTensor.createTensor(env, arrayOf(tokenized.attentionMask))
 
             inputIdsTensor.use { ids ->
                 maskTensor.use { mask ->
@@ -346,10 +341,6 @@ class LayaEngine(context: Context) {
         val maxMarkers = 6
         val batch = questions.size
 
-        val flatInputIds = LongArray(batch * maxSeqLen) { tokenizer.padId.toLong() }
-        val flatAttentionMask = LongArray(batch * maxSeqLen) { 0L }
-        val flatMarkerPos = LongArray(batch * maxMarkers) { 0L }
-        val flatMarkerMask = ByteArray(batch * maxMarkers) { 0 }
         val qtypes = LongArray(batch)
         var actualMaxSeq = 1
 
@@ -379,30 +370,31 @@ class LayaEngine(context: Context) {
             seq.take(len) to markers
         }
 
-        // Pack tightly to actualMaxSeq
-        val packedIds = LongArray(batch * actualMaxSeq) { tokenizer.padId.toLong() }
-        val packedMask = LongArray(batch * actualMaxSeq) { 0L }
+        // Pack tightly to actualMaxSeq as 2D arrays for safe OnnxTensor creation
+        val packedIds = Array(batch) { LongArray(actualMaxSeq) { tokenizer.padId.toLong() } }
+        val packedMask = Array(batch) { LongArray(actualMaxSeq) { 0L } }
+        val markerPosArr = Array(batch) { LongArray(maxMarkers) { 0L } }
+        val markerMaskArr = Array(batch) { BooleanArray(maxMarkers) { false } }
+
         encodedSequences.forEachIndexed { row, (seq, markers) ->
-            val rowOffset = row * actualMaxSeq
             for (i in seq.indices) {
-                packedIds[rowOffset + i] = seq[i].toLong()
-                packedMask[rowOffset + i] = 1L
+                packedIds[row][i] = seq[i].toLong()
+                packedMask[row][i] = 1L
             }
-            val markerOffset = row * maxMarkers
             for (mIdx in markers.indices) {
                 if (mIdx < maxMarkers) {
-                    flatMarkerPos[markerOffset + mIdx] = markers[mIdx].toLong()
-                    flatMarkerMask[markerOffset + mIdx] = 1
+                    markerPosArr[row][mIdx] = markers[mIdx].toLong()
+                    markerMaskArr[row][mIdx] = true
                 }
             }
         }
 
         val logitsRows: Array<FloatArray> = sessionMutex.withLock {
-            val idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(packedIds), longArrayOf(batch.toLong(), actualMaxSeq.toLong()))
-            val maskTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(packedMask), longArrayOf(batch.toLong(), actualMaxSeq.toLong()))
-            val mPosTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(flatMarkerPos), longArrayOf(batch.toLong(), maxMarkers.toLong()))
-            val mMaskTensor = OnnxTensor.createTensor(env, ByteBuffer.wrap(flatMarkerMask), longArrayOf(batch.toLong(), maxMarkers.toLong()), ai.onnxruntime.OnnxJavaType.BOOL)
-            val qtypeTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(qtypes), longArrayOf(batch.toLong()))
+            val idsTensor = OnnxTensor.createTensor(env, packedIds)
+            val maskTensor = OnnxTensor.createTensor(env, packedMask)
+            val mPosTensor = OnnxTensor.createTensor(env, markerPosArr)
+            val mMaskTensor = OnnxTensor.createTensor(env, markerMaskArr)
+            val qtypeTensor = OnnxTensor.createTensor(env, qtypes)
 
             idsTensor.use { t0 ->
                 maskTensor.use { t1 ->
@@ -596,6 +588,7 @@ class LayaEngine(context: Context) {
     }
 
     companion object {
+        private const val TAG = "LayaEngine"
         private const val PREFS_NAME = "unsend_prefs"
         private const val KEY_PREVIEW_MODE = "preview_mode_enabled"
         const val DEFAULT_MODEL_FILENAME = "laya.onnx"
