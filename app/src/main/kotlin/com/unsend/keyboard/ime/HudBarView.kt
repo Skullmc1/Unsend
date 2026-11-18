@@ -29,6 +29,7 @@ class HudBarView(context: Context) : LinearLayout(context) {
     var onToggleReplyCheck: (() -> Unit)? = null
     var onClearReplyContext: (() -> Unit)? = null
     var onOpenSetup: (() -> Unit)? = null
+    var onSelectSuggestion: ((String) -> Unit)? = null
 
     private val presetLabel: TextView
     private val statusContainer: LinearLayout
@@ -36,6 +37,9 @@ class HudBarView(context: Context) : LinearLayout(context) {
     private val statusLabel: TextView
     private val replyChip: TextView
     private val expandButton: TextView
+
+    private val suggestionStrip: LinearLayout
+    private val suggestionHairline: View
 
     private val drawerContainer: LinearLayout
     private val replyPreviewRow: LinearLayout
@@ -261,6 +265,54 @@ class HudBarView(context: Context) : LinearLayout(context) {
 
         // Bottom hairline below toolbar
         addView(hairlineView())
+
+        // 3. Autocorrect Suggestion Strip (hidden when empty)
+        suggestionStrip = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = GONE
+            setBackgroundColor(COLOR_BLACK)
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, dp(34))
+        }
+        suggestionHairline = hairlineView().apply { visibility = GONE }
+        addView(suggestionStrip)
+        addView(suggestionHairline)
+    }
+
+    fun updateSuggestions(suggestions: List<String>, hasAutoReplace: Boolean) {
+        suggestionStrip.removeAllViews()
+        if (suggestions.isEmpty()) {
+            suggestionStrip.visibility = GONE
+            suggestionHairline.visibility = GONE
+            return
+        }
+        suggestionStrip.visibility = VISIBLE
+        suggestionHairline.visibility = VISIBLE
+
+        suggestions.take(3).forEachIndexed { index, word ->
+            if (index > 0) {
+                suggestionStrip.addView(
+                    View(context).apply {
+                        setBackgroundColor(COLOR_HAIRLINE)
+                        layoutParams = LayoutParams(dp(1).coerceAtLeast(1), dp(16))
+                    },
+                )
+            }
+            val isPrimaryFix = index == 0 && hasAutoReplace
+            val tv = TextView(context).apply {
+                text = word
+                gravity = Gravity.CENTER
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+                setTextColor(if (isPrimaryFix) COLOR_WHITE else COLOR_TEXT_SECONDARY)
+                setTypeface(null, if (isPrimaryFix) Typeface.BOLD else Typeface.NORMAL)
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                layoutParams = LayoutParams(0, LayoutParams.MATCH_PARENT, 1f)
+                setOnClickListener { onSelectSuggestion?.invoke(word) }
+            }
+            suggestionStrip.addView(tv)
+        }
     }
 
     fun toggleDrawer() {

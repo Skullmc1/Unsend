@@ -30,6 +30,7 @@ import kotlinx.coroutines.launch
 class UnsendImeService : InputMethodService() {
 
     private lateinit var layaEngine: LayaEngine
+    private lateinit var autocorrectEngine: AutocorrectEngine
     private var hudBarView: HudBarView? = null
     private var keyboardView: KeyboardView? = null
 
@@ -40,10 +41,16 @@ class UnsendImeService : InputMethodService() {
     private var currentPreset: ContextPreset = ContextPreset.WORK
     private var incomingReplyContext: String? = null
     private var lastAnalysis: LayaAnalysis? = null
+    private var currentAutocorrect: AutocorrectResult? = null
+    private var currentWordLength: Int = 0
 
     override fun onCreate() {
         super.onCreate()
         layaEngine = LayaEngine(this)
+        autocorrectEngine = AutocorrectEngine(this)
+        serviceScope.launch(Dispatchers.Default) {
+            autocorrectEngine.ensureLoaded()
+        }
     }
 
     override fun onCreateInputView(): View {
@@ -77,13 +84,27 @@ class UnsendImeService : InputMethodService() {
                 }
                 startActivity(intent)
             }
+            onSelectSuggestion = { chosen ->
+                applySuggestion(chosen)
+            }
         }
 
         val keyboard = KeyboardView(this).apply {
             listener = object : KeyboardView.Listener {
                 override fun onCharacter(text: String) {
                     val ic = currentInputConnection ?: return
+                    if (text in WORD_SEPARATORS) {
+                        val fix = currentAutocorrect?.autoReplace
+                        val len = currentWordLength
+                        if (!fix.isNullOrEmpty() && len > 0) {
+                            ic.beginBatchEdit()
+                            ic.deleteSurroundingText(len, 0)
+                            ic.commitText(fix, 1)
+                            ic.endBatchEdit()
+                        }
+                    }
                     ic.commitText(text, 1)
+                    updateAutocorrectAndShift()
                     val isSentenceEnd = text in SENTENCE_END_PUNCTUATION
                     scheduleEvaluation(immediate = isSentenceEnd)
                 }
@@ -96,6 +117,7 @@ class UnsendImeService : InputMethodService() {
                     } else {
                         ic.deleteSurroundingText(1, 0)
                     }
+                    updateAutocorrectAndShift()
                     scheduleEvaluation(immediate = false)
                 }
 
@@ -109,6 +131,7 @@ class UnsendImeService : InputMethodService() {
                     } else {
                         sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
                     }
+                    updateAutocorrectAndShift()
                     scheduleEvaluation(immediate = true)
                 }
             }
@@ -130,6 +153,7 @@ class UnsendImeService : InputMethodService() {
         serviceScope.launch {
             layaEngine.ensureLoaded()
         }
+        updateAutocorrectAndShift()
         refreshHudIdleOrEvaluate()
     }
 
@@ -255,6 +279,56 @@ class UnsendImeService : InputMethodService() {
         }
     }
 
+    private fun applySuggestion(chosen: String) {
+        val ic = currentInputConnection ?: return
+        val word = extractCurrentWordBeforeCursor()
+        if (word.isNotEmpty()) {
+            ic.beginBatchEdit()
+            ic.deleteSurroundingText(word.length, 0)
+            ic.commitText("$chosen ", 1)
+            ic.endBatchEdit()
+        } else {
+            ic.commitText("$chosen ", 1)
+        }
+        updateAutocorrectAndShift()
+        scheduleEvaluation(immediate = false)
+    }
+
+    private fun updateAutocorrectAndShift() {
+        val ic = currentInputConnection
+        val before = ic?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+        val word = extractWordTail(before)
+        currentWordLength = word.length
+
+        if (word.length >= 2) {
+            val result = autocorrectEngine.suggest(word)
+            currentAutocorrect = result
+            hudBarView?.updateSuggestions(result.suggestions, result.autoReplace != null)
+        } else {
+            currentAutocorrect = null
+            hudBarView?.updateSuggestions(emptyList(), false)
+        }
+
+        val shouldCap = before.isEmpty() ||
+            before.endsWith("\n") ||
+            Regex("""[.!?]\s+$""").containsMatchIn(before)
+        keyboardView?.setAutoShift(shouldCap)
+    }
+
+    private fun extractCurrentWordBeforeCursor(): String {
+        val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+        return extractWordTail(before)
+    }
+
+    private fun extractWordTail(text: String): String {
+        if (text.isEmpty()) return ""
+        var idx = text.length
+        while (idx > 0 && (text[idx - 1].isLetter() || text[idx - 1] == '\'')) {
+            idx--
+        }
+        return text.substring(idx)
+    }
+
     private fun readCurrentDraft(): String {
         val ic = currentInputConnection ?: return ""
         val extracted = ic.getExtractedText(ExtractedTextRequest(), 0)?.text?.toString()
@@ -268,5 +342,6 @@ class UnsendImeService : InputMethodService() {
     companion object {
         private const val DEBOUNCE_MS = 700L
         private val SENTENCE_END_PUNCTUATION = setOf(".", "?", "!")
+        private val WORD_SEPARATORS = setOf(" ", ".", ",", "!", "?", ";", ":")
     }
 }

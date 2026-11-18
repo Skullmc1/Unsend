@@ -510,6 +510,7 @@ class LayaEngine(context: Context) {
     ): LayaAnalysis {
         val trimmed = draft.trim()
         val lower = trimmed.lowercase()
+        val words = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
 
         val upperCount = trimmed.count { it.isUpperCase() }
         val letterCount = trimmed.count { it.isLetter() }.coerceAtLeast(1)
@@ -517,20 +518,27 @@ class LayaEngine(context: Context) {
 
         val exclamations = trimmed.count { it == '!' }
         val questionMarks = trimmed.count { it == '?' }
+        val hasCurtCommand = lower.startsWith("fix ") || lower.startsWith("do ") ||
+            lower.startsWith("send ") || lower.startsWith("stop ") || lower.endsWith(" now.") || lower.endsWith(" now!")
 
         val aggressiveHits = AGGRESSIVE_TERMS.count { lower.contains(it) }
         val passiveAggressiveHits = PASSIVE_AGGRESSIVE_TERMS.count { lower.contains(it) }
         val defensiveHits = DEFENSIVE_TERMS.count { lower.contains(it) }
         val warmHits = WARM_TERMS.count { lower.contains(it) }
         val assertiveHits = ASSERTIVE_TERMS.count { lower.contains(it) }
+        val unclearHits = UNCLEAR_TERMS.count { lower.contains(it) }
 
-        var risk = 0.14f
-        risk += aggressiveHits * 0.22f
-        risk += passiveAggressiveHits * 0.17f
-        risk += defensiveHits * 0.13f
-        risk += (exclamations.coerceAtMost(3) * 0.08f)
-        if (capsRatio > 0.35f && trimmed.length > 18) risk += 0.25f
-        risk -= warmHits * 0.09f
+        var risk = 0.08f
+        risk += aggressiveHits * 0.23f
+        risk += passiveAggressiveHits * 0.19f
+        risk += defensiveHits * 0.15f
+        if (hasCurtCommand && warmHits == 0) risk += 0.18f
+        if (exclamations > 1 || (exclamations == 1 && warmHits == 0 && aggressiveHits > 0)) {
+            risk += exclamations.coerceAtMost(3) * 0.09f
+        }
+        if (capsRatio > 0.35f && trimmed.length > 12) risk += 0.28f
+        risk -= (warmHits * 0.06f).coerceAtMost(0.12f)
+        if (questionMarks > 0 && aggressiveHits == 0 && defensiveHits == 0) risk -= 0.02f
         if (preset == ContextPreset.WORK || preset == ContextPreset.NEGOTIATION) {
             risk += aggressiveHits * 0.05f
         }
@@ -538,24 +546,23 @@ class LayaEngine(context: Context) {
 
         val rawToneScores = floatArrayOf(
             // WARM
-            0.35f + warmHits * 0.55f - aggressiveHits * 0.25f,
+            0.42f + warmHits * 0.55f + (if (questionMarks == 1 && aggressiveHits == 0 && assertiveHits == 0) 0.15f else 0f) - aggressiveHits * 0.30f,
             // ASSERTIVE
-            0.25f + assertiveHits * 0.45f + (if (trimmed.length > 40) 0.15f else 0f),
+            0.30f + assertiveHits * 0.50f + (if (words.size >= 8 && aggressiveHits == 0) 0.15f else 0f),
             // DEFENSIVE
-            0.15f + defensiveHits * 0.65f,
+            0.12f + defensiveHits * 0.72f,
             // PASSIVE_AGGRESSIVE
-            0.12f + passiveAggressiveHits * 0.70f,
+            0.10f + passiveAggressiveHits * 0.75f,
             // BLUNT
-            0.18f + aggressiveHits * 0.50f + (if (trimmed.length < 32 && warmHits == 0) 0.25f else 0f),
+            0.12f + aggressiveHits * 0.58f + (if (hasCurtCommand && warmHits == 0) 0.48f else 0f) + (if (capsRatio > 0.45f) 0.35f else 0f),
             // UNCLEAR
-            0.10f + (if (questionMarks > 1 || trimmed.split(' ').size < 4) 0.35f else 0f),
+            0.10f + unclearHits * 0.55f + (if (questionMarks > 1) 0.35f else 0f),
         )
         val toneProbs = ToneSchema.softmax(rawToneScores)
         val toneMap = ToneLabel.entries.mapIndexed { idx, label -> label to toneProbs[idx] }.toMap()
         val primaryTone = toneMap.maxByOrNull { it.value }?.key ?: ToneLabel.WARM
 
-        val words = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val clarity = (0.58f + (words.size.coerceAtMost(18) * 0.018f) - (if (capsRatio > 0.4f) 0.15f else 0f))
+        val clarity = (0.62f + (words.size.coerceAtMost(16) * 0.018f) - (unclearHits * 0.14f) - (if (capsRatio > 0.45f) 0.14f else 0f))
             .coerceIn(0.25f, 0.96f)
 
         val answeredScore = if (!incomingReply.isNullOrBlank()) {
@@ -605,22 +612,29 @@ class LayaEngine(context: Context) {
         private val AGGRESSIVE_TERMS = listOf(
             "ridiculous", "unacceptable", "seriously", "wtf", "whatever", "never",
             "always do this", "waste of time", "stop", "annoying", "stupid", "honestly",
+            "makes no sense", "fix it", "shut up", "useless", "wrong", "terrible",
         )
         private val PASSIVE_AGGRESSIVE_TERMS = listOf(
             "per my last", "as i already", "just saying", "fine.", "k.", "thanks in advance",
             "if you actually", "no worries at all", "interesting choice", "good luck with that",
+            "sure whatever", "must be nice",
         )
         private val DEFENSIVE_TERMS = listOf(
-            "i didn't", "not my fault", "you're the one", "i already told", "why are you",
-            "that's not what i", "blame", "i had no choice",
+            "i didn't", "did not", "not my fault", "my fault", "you're the one", "i already told",
+            "why are you", "that's not what i", "blame", "had no choice", "wasn't me", "not fair",
         )
         private val WARM_TERMS = listOf(
-            "thanks", "thank you", "appreciate", "please", "happy to", "sounds great",
-            "glad", "hope you", "sorry", "love", "care", "understand",
+            "hey", "hi ", "hello", "thanks", "thank you", "appreciate", "please", "happy to",
+            "sounds great", "sounds good", "glad", "hope", "sorry", "love", "care",
+            "understand", "awesome", "great", "no problem", "for sure", "looking forward",
         )
         private val ASSERTIVE_TERMS = listOf(
             "let's", "we need", "i prefer", "i'd like", "by friday", "moving forward",
-            "can we", "please confirm", "here is", "my availability",
+            "can we", "could we", "please confirm", "here is", "my availability",
+            "let me know", "schedule", "update", "deadline", "review", "plan", "suggest",
+        )
+        private val UNCLEAR_TERMS = listOf(
+            "idk", "maybe", "sort of", "kind of", "stuff", "things", "umm", "huh", "wait what",
         )
         private val STOP_WORDS = setOf(
             "what", "when", "where", "which", "that", "this", "with", "from", "have",

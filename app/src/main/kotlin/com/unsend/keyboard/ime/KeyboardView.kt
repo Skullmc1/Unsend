@@ -69,6 +69,15 @@ class KeyboardView(context: Context) : LinearLayout(context) {
         }
     }
 
+    fun setAutoShift(shouldCapitalize: Boolean) {
+        if (currentLayer != Layer.QWERTY || shiftState == ShiftState.CAPS_LOCK) return
+        val target = if (shouldCapitalize) ShiftState.SINGLE else ShiftState.OFF
+        if (shiftState != target) {
+            shiftState = target
+            rebuildKeys()
+        }
+    }
+
     private fun rebuildKeys() {
         removeAllViews()
         when (currentLayer) {
